@@ -60,6 +60,8 @@ jobs:
     needs: frontend
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    env:
+      GOTOOLCHAIN: ${{ matrix.target == 'linux-loong64-abi1.0' && 'local' || 'auto' }}
     strategy:
       fail-fast: false
       max-parallel: 10
@@ -120,7 +122,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          go-version: ${{ matrix.target == 'linux-loong64-abi1.0' && '1.26.4' || '1.27.3' }}
           cache: true
       - uses: actions/download-artifact@v4
         with:
@@ -170,7 +172,7 @@ jobs:
             (cd binaries && zip -q ../release/openlist-${TARGET}.zip openlist.exe BUILD_INFO.txt LICENSE)
           else
             test -s binaries/openlist
-            chmod +x binaries/openlist
+            sudo chmod +x binaries/openlist
             if [[ "$TARGET" == *-musl* ]]; then
               if readelf -l binaries/openlist | grep -q 'Requesting program interpreter'; then
                 echo 'ERROR: musl binary is dynamically linked'; exit 1
