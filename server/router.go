@@ -1,0 +1,367 @@
+package server
+
+import (
+	"github.com/OpenListTeam/OpenList/v4/cmd/flags"
+	"github.com/OpenListTeam/OpenList/v4/internal/conf"
+	"github.com/OpenListTeam/OpenList/v4/internal/message"
+	multipartPkg "github.com/OpenListTeam/OpenList/v4/internal/multipart"
+	"github.com/OpenListTeam/OpenList/v4/internal/sign"
+	"github.com/OpenListTeam/OpenList/v4/internal/stream"
+	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
+	"github.com/OpenListTeam/OpenList/v4/server/common"
+	"github.com/OpenListTeam/OpenList/v4/server/handles"
+	"github.com/OpenListTeam/OpenList/v4/server/middlewares"
+	"github.com/OpenListTeam/OpenList/v4/server/static"
+	"github.com/gin-contrib/cors"
+	"github.com/gin-gonic/gin"
+)
+
+func Init(e *gin.Engine) {
+	e.ContextWithFallback = true
+	if !utils.SliceContains([]string{"", "/"}, conf.URL.Path) {
+		e.GET("/", func(c *gin.Context) {
+			c.Redirect(302, conf.URL.Path)
+		})
+	}
+	Cors(e)
+	g := e.Group(conf.URL.Path)
+	if conf.Conf.Scheme.HttpPort != -1 && conf.Conf.Scheme.HttpsPort != -1 && conf.Conf.Scheme.ForceHttps {
+		e.Use(middlewares.ForceHttps)
+	}
+	g.Any("/ping", func(c *gin.Context) {
+		c.String(200, "pong")
+	})
+	g.GET("/favicon.ico", handles.Favicon)
+	g.GET("/robots.txt", handles.Robots)
+	g.GET("/manifest.json", static.ManifestJSON)
+	g.GET("/i/:link_name", handles.Plist)
+	common.SecretKey = []byte(conf.Conf.JwtSecret)
+	g.Use(middlewares.StoragesLoaded)
+	if conf.Conf.MaxConnections > 0 {
+		g.Use(middlewares.MaxAllowed(conf.Conf.MaxConnections))
+	}
+	WebDav(g.Group("/dav"))
+	S3(g.Group("/s3"))
+	MCP(g)
+
+	downloadLimiter := middlewares.DownloadRateLimiter(stream.ClientDownloadLimit)
+	signCheck := middlewares.Down(sign.Verify)
+	g.GET("/d/*path", middlewares.PathParse, signCheck, downloadLimiter, handles.Down)
+	g.GET("/p/*path", middlewares.PathParse, signCheck, downloadLimiter, handles.Proxy)
+	g.HEAD("/d/*path", middlewares.PathParse, signCheck, handles.Down)
+	g.HEAD("/p/*path", middlewares.PathParse, signCheck, handles.Proxy)
+	archiveSignCheck := middlewares.Down(sign.VerifyArchive)
+	g.GET("/ad/*path", middlewares.PathParse, archiveSignCheck, downloadLimiter, handles.ArchiveDown)
+	g.GET("/ap/*path", middlewares.PathParse, archiveSignCheck, downloadLimiter, handles.ArchiveProxy)
+	g.GET("/ae/*path", middlewares.PathParse, archiveSignCheck, downloadLimiter, handles.ArchiveInternalExtract)
+	g.HEAD("/ad/*path", middlewares.PathParse, archiveSignCheck, handles.ArchiveDown)
+	g.HEAD("/ap/*path", middlewares.PathParse, archiveSignCheck, handles.ArchiveProxy)
+	g.HEAD("/ae/*path", middlewares.PathParse, archiveSignCheck, handles.ArchiveInternalExtract)
+
+	g.GET("/sd/:sid", middlewares.EmptyPathParse, middlewares.SharingIdParse, downloadLimiter, handles.SharingDown)
+	g.GET("/sd/:sid/*path", middlewares.PathParse, middlewares.SharingIdParse, downloadLimiter, handles.SharingDown)
+	g.HEAD("/sd/:sid", middlewares.EmptyPathParse, middlewares.SharingIdParse, handles.SharingDown)
+	g.HEAD("/sd/:sid/*path", middlewares.PathParse, middlewares.SharingIdParse, handles.SharingDown)
+	g.GET("/sad/:sid", middlewares.EmptyPathParse, middlewares.SharingIdParse, downloadLimiter, handles.SharingArchiveExtract)
+	g.GET("/sad/:sid/*path", middlewares.PathParse, middlewares.SharingIdParse, downloadLimiter, handles.SharingArchiveExtract)
+	g.HEAD("/sad/:sid", middlewares.EmptyPathParse, middlewares.SharingIdParse, handles.SharingArchiveExtract)
+	g.HEAD("/sad/:sid/*path", middlewares.PathParse, middlewares.SharingIdParse, handles.SharingArchiveExtract)
+
+	// 转码播放：master/variant playlist 与切片下发；token 已包含在路径中作为鉴权
+	g.GET("/tc/:job/:token/master.m3u8", handles.TCMaster)
+	g.GET("/tc/:job/:token/:profile/playlist.m3u8", handles.TCPlaylist)
+	g.GET("/tc/:job/:token/:profile/:seg", handles.TCSegment)
+
+	api := g.Group("/api")
+	auth := api.Group("", middlewares.Auth(false))
+	webauthn := api.Group("/authn", middlewares.Authn)
+
+	api.POST("/auth/login", handles.Login)
+	api.POST("/auth/login/hash", handles.LoginHash)
+	api.POST("/auth/login/ldap", handles.LoginLdap)
+	auth.GET("/me", handles.CurrentUser)
+	auth.POST("/me/update", handles.UpdateCurrent)
+	// 媒体应用密钥（每个登录用户都可以为自己的客户端签发密钥）
+	auth.GET("/me/appkey/list", handles.ListMediaAppKeys)
+	auth.POST("/me/appkey/create", handles.CreateMediaAppKey)
+	auth.POST("/me/appkey/delete", handles.DeleteMediaAppKey)
+	auth.GET("/me/sshkey/list", handles.ListMyPublicKey)
+	auth.POST("/me/sshkey/add", handles.AddMyPublicKey)
+	auth.POST("/me/sshkey/delete", handles.DeleteMyPublicKey)
+	auth.POST("/auth/2fa/generate", handles.Generate2FA)
+	auth.POST("/auth/2fa/verify", handles.Verify2FA)
+	auth.GET("/auth/logout", handles.LogOut)
+
+	// auth
+	api.GET("/auth/sso", handles.SSOLoginRedirect)
+	api.GET("/auth/sso_callback", handles.SSOLoginCallback)
+	api.GET("/auth/get_sso_id", handles.SSOLoginCallback)
+	api.GET("/auth/sso_get_token", handles.SSOLoginCallback)
+
+	// webauthn
+	api.GET("/authn/webauthn_begin_login", handles.BeginAuthnLogin)
+	api.POST("/authn/webauthn_finish_login", handles.FinishAuthnLogin)
+	webauthn.GET("/webauthn_begin_registration", handles.BeginAuthnRegistration)
+	webauthn.POST("/webauthn_finish_registration", handles.FinishAuthnRegistration)
+	webauthn.POST("/delete_authn", handles.DeleteAuthnLogin)
+	webauthn.GET("/getcredentials", handles.GetAuthnCredentials)
+
+	// no need auth
+	public := api.Group("/public")
+	public.Any("/settings", handles.PublicSettings)
+	public.GET("/media_status", handles.PublicMediaStatus)
+	// 封面代理与本地缩略图（媒体库页面使用，免鉴权）
+	public.GET("/media/proxy", handles.PublicMediaProxy)
+	public.GET("/media/thumb", handles.PublicMediaThumb)
+	public.Any("/offline_download_tools", handles.OfflineDownloadTools)
+	public.Any("/archive_extensions", handles.ArchiveExtensions)
+	public.Any("/init_status", handles.InitStatus)
+	public.POST("/init/setup", handles.InitSetup)
+
+	// 转码 Worker 协议端点（远程 Worker 节点对接，由共享密钥/token 鉴权，无需登录）
+	transcodeWorker := api.Group("/transcode/worker")
+	transcodeWorker.POST("/register", handles.WorkerRegister)
+	transcodeWorker.POST("/heartbeat", handles.WorkerHeartbeat)
+	transcodeWorker.POST("/claim", handles.WorkerClaim)
+	transcodeWorker.PUT("/segment", handles.WorkerSegmentUpload)
+	transcodeWorker.POST("/job/finish", handles.WorkerJobFinish)
+
+	// Emby 兼容 API（自带鉴权与开关判断，路径大小写由 handler 归一化）
+	// 使用 @ 前缀，避免与用户自己创建的 /emby、/rest 目录冲突
+	g.Any("/@emby/*path", handles.EmbyAPI)
+	g.Any("/@mediabrowser/*path", handles.EmbyAPI)
+	// OpenSubsonic API（自带鉴权与开关判断）
+	g.Any("/@rest/*path", handles.SubsonicAPI)
+
+	_fs(auth.Group("/fs"))
+	// 媒体库公开 API：与文件浏览一致，允许访客访问（访客仍受自身 base_path/权限限制）
+	mediaPublic := auth.Group("/fs/media", handles.RequireMediaEnabled)
+	mediaPublic.GET("/list", handles.PublicListMedia)
+	mediaPublic.GET("/item/:id", handles.PublicGetMedia)
+	mediaPublic.GET("/albums", handles.PublicListAlbums)
+	mediaPublic.GET("/album", handles.PublicGetAlbum)
+	mediaPublic.GET("/folders", handles.PublicListFolders)
+	mediaPublic.GET("/scan_paths", handles.PublicListScanPaths)
+	mediaPublic.GET("/strm", handles.GetMediaStrm)
+	mediaPublic.GET("/stream_url", handles.GetMediaStreamURL)
+	// 播放进度与收藏（与 Emby / Subsonic 共用同一份用户数据）
+	mediaPublic.GET("/userdata", handles.GetMediaUserDataBatch)
+	mediaPublic.GET("/progress", handles.GetMediaProgress)
+	mediaPublic.POST("/progress", handles.SaveMediaProgress)
+	mediaPublic.POST("/favorite", handles.SetMediaFavorite)
+	mediaPublic.GET("/favorites", handles.ListMediaFavoritesAPI)
+	mediaPublic.GET("/resume", handles.ListMediaResumeAPI)
+	// 阅读器批注（登录用户私有数据；访客只读返回空列表，写入直接 403）
+	mediaPublic.GET("/annotations", handles.ListMediaAnnotationsAPI)
+	mediaPublic.POST("/annotations", handles.SyncMediaAnnotationsAPI)
+	fsAndShare(api.Group("/fs", middlewares.Auth(true)))
+	_task(auth.Group("/task", middlewares.AuthNotGuest))
+	_sharing(auth.Group("/share", middlewares.AuthNotGuest))
+	admin(auth.Group("/admin", middlewares.AuthAdmin))
+	if flags.Debug || flags.Dev {
+		debug(g.Group("/debug"))
+	}
+	static.Static(g, func(handlers ...gin.HandlerFunc) {
+		e.NoRoute(handlers...)
+	})
+}
+
+func admin(g *gin.RouterGroup) {
+	meta := g.Group("/meta")
+	meta.GET("/list", handles.ListMetas)
+	meta.GET("/get", handles.GetMeta)
+	meta.POST("/create", handles.CreateMeta)
+	meta.POST("/update", handles.UpdateMeta)
+	meta.POST("/delete", handles.DeleteMeta)
+
+	user := g.Group("/user")
+	user.GET("/list", handles.ListUsers)
+	user.GET("/get", handles.GetUser)
+	user.POST("/create", handles.CreateUser)
+	user.POST("/update", handles.UpdateUser)
+	user.POST("/cancel_2fa", handles.Cancel2FAById)
+	user.POST("/delete", handles.DeleteUser)
+	user.POST("/del_cache", handles.DelUserCache)
+	user.GET("/sshkey/list", handles.ListPublicKeys)
+	user.POST("/sshkey/delete", handles.DeletePublicKey)
+
+	storage := g.Group("/storage")
+	storage.GET("/list", handles.ListStorages)
+	storage.GET("/get", handles.GetStorage)
+	storage.POST("/create", handles.CreateStorage)
+	storage.POST("/update", handles.UpdateStorage)
+	storage.POST("/delete", handles.DeleteStorage)
+	storage.POST("/enable", handles.EnableStorage)
+	storage.POST("/disable", handles.DisableStorage)
+	storage.POST("/load_all", handles.LoadAllStorages)
+
+	driver := g.Group("/driver")
+	driver.GET("/list", handles.ListDriverInfo)
+	driver.GET("/names", handles.ListDriverNames)
+	driver.GET("/info", handles.GetDriverInfo)
+
+	setting := g.Group("/setting")
+	setting.GET("/get", handles.GetSetting)
+	setting.GET("/list", handles.ListSettings)
+	setting.POST("/save", handles.SaveSettings)
+	setting.POST("/delete", handles.DeleteSetting)
+	setting.POST("/default", handles.DefaultSettings)
+	setting.POST("/reset_token", handles.ResetToken)
+	setting.POST("/set_aria2", handles.SetAria2)
+	setting.POST("/set_qbit", handles.SetQbittorrent)
+	setting.POST("/set_transmission", handles.SetTransmission)
+	setting.POST("/set_115", handles.Set115)
+	setting.POST("/set_115_open", handles.Set115Open)
+	setting.POST("/set_123_pan", handles.Set123Pan)
+	setting.POST("/set_123_open", handles.Set123Open)
+	setting.POST("/set_pikpak", handles.SetPikPak)
+	setting.POST("/set_thunder", handles.SetThunder)
+	setting.POST("/set_thunderx", handles.SetThunderX)
+	setting.POST("/set_thunder_browser", handles.SetThunderBrowser)
+	setting.POST("/set_guangyapan", handles.SetGuangYaPan)
+
+	// retain /admin/task API to ensure compatibility with legacy automation scripts
+	_task(g.Group("/task"))
+
+	ms := g.Group("/message")
+	ms.POST("/get", message.HttpInstance.GetHandle)
+	ms.POST("/send", message.HttpInstance.SendHandle)
+
+	index := g.Group("/index")
+	index.POST("/build", middlewares.SearchIndex, handles.BuildIndex)
+	index.POST("/update", middlewares.SearchIndex, handles.UpdateIndex)
+	index.POST("/stop", middlewares.SearchIndex, handles.StopIndex)
+	index.POST("/clear", middlewares.SearchIndex, handles.ClearIndex)
+	index.GET("/progress", middlewares.SearchIndex, handles.GetProgress)
+
+	scan := g.Group("/scan")
+	scan.POST("/start", handles.StartManualScan)
+	scan.POST("/stop", handles.StopManualScan)
+	scan.GET("/progress", handles.GetManualScanProgress)
+
+	// 媒体库管理
+	mediaAdmin := g.Group("/media")
+	mediaAdmin.GET("/config/list", handles.ListMediaConfigs)
+	mediaAdmin.POST("/config/save", handles.SaveMediaConfig)
+	mediaAdmin.GET("/items", handles.ListMediaItemsAdmin)
+	mediaAdmin.POST("/items/update", handles.UpdateMediaItemAdmin)
+	mediaAdmin.POST("/items/delete", handles.DeleteMediaItemAdmin)
+	mediaAdmin.POST("/scan/start", handles.StartMediaScan)
+	mediaAdmin.GET("/scan/progress", handles.GetMediaScanProgress)
+	mediaAdmin.POST("/scrape/start", handles.StartMediaScrape)
+	mediaAdmin.GET("/scrape/stats", handles.GetMediaScrapeStats)
+	mediaAdmin.POST("/clear", handles.ClearMediaDB)
+	mediaAdmin.POST("/clear_scrape", handles.ClearMediaScrape)
+	mediaAdmin.POST("/delete_invalid", handles.DeleteInvalidMedia)
+	// 扫描路径管理
+	mediaAdmin.GET("/scan_paths", handles.ListMediaScanPaths)
+	mediaAdmin.POST("/scan_paths/create", handles.CreateMediaScanPath)
+	mediaAdmin.POST("/scan_paths/update", handles.UpdateMediaScanPath)
+	mediaAdmin.POST("/scan_paths/delete", handles.DeleteMediaScanPath)
+	mediaAdmin.POST("/scan_paths/clear", handles.ClearMediaScanPathDB)
+	// 导入 / 导出
+	mediaAdmin.GET("/export", handles.ExportMediaDB)
+	mediaAdmin.POST("/import", handles.ImportMediaDB)
+	// 媒体应用密钥（Subsonic/Emby/MoviePilot 等无交互客户端）
+	mediaAdmin.GET("/appkey/list", handles.ListMediaAppKeys)
+	mediaAdmin.POST("/appkey/create", handles.CreateMediaAppKey)
+	mediaAdmin.POST("/appkey/delete", handles.DeleteMediaAppKey)
+	// STRM 批量生成
+	mediaAdmin.POST("/strm/generate", handles.GenerateMediaStrm)
+
+	// 转码管理
+	transcodeAdmin := g.Group("/transcode")
+	transcodeAdmin.GET("/workers", handles.ListTranscodeWorkers)
+	transcodeAdmin.GET("/jobs", handles.ListTranscodeJobs)
+	transcodeAdmin.POST("/cancel", handles.CancelTranscodeJob)
+}
+
+func fsAndShare(g *gin.RouterGroup) {
+	g.Any("/list", handles.FsListSplit)
+	g.Any("/get", handles.FsGetSplit)
+	a := g.Group("/archive")
+	a.Any("/meta", handles.FsArchiveMetaSplit)
+	a.Any("/list", handles.FsArchiveListSplit)
+
+	// 转码 - 用户态：申请播放
+	g.POST("/transcode/play", handles.RequireMediaEnabled, handles.TranscodePlay)
+}
+
+func _fs(g *gin.RouterGroup) {
+	g.Any("/search", middlewares.SearchIndex, handles.Search)
+	g.Any("/other", handles.FsOther)
+	g.Any("/dirs", handles.FsDirs)
+	g.POST("/mkdir", handles.FsMkdir)
+	g.POST("/rename", handles.FsRename)
+	g.POST("/batch_rename", handles.FsBatchRename)
+	g.POST("/regex_rename", handles.FsRegexRename)
+	g.POST("/move", handles.FsMove)
+	g.POST("/recursive_move", handles.FsRecursiveMove)
+	g.POST("/copy", handles.FsCopy)
+	g.POST("/remove", handles.FsRemove)
+	g.POST("/remove_empty_directory", handles.FsRemoveEmptyDirectory)
+	uploadLimiter := middlewares.UploadRateLimiter(stream.ClientUploadLimit)
+	g.PUT("/put", middlewares.FsUp, uploadLimiter, handles.FsStream)
+	g.PUT("/form", middlewares.FsUp, uploadLimiter, handles.FsForm)
+	multipartPkg.DefaultManager.StartGC() // reclaim ring files orphaned by a previous run
+	multipart := g.Group("/multipart")
+	multipart.POST("/init", middlewares.FsUp, handles.MultipartInit)
+	multipart.PUT("/chunk", uploadLimiter, handles.MultipartChunk)
+	multipart.POST("/complete", handles.MultipartComplete)
+	multipart.GET("/status", handles.MultipartStatus)
+	multipart.POST("/abort", handles.MultipartAbort)
+	g.POST("/link", middlewares.AuthAdmin, handles.Link)
+	// g.POST("/add_aria2", handles.AddOfflineDownload)
+	// g.POST("/add_qbit", handles.AddQbittorrent)
+	// g.POST("/add_transmission", handles.SetTransmission)
+	g.POST("/add_offline_download", handles.AddOfflineDownload)
+	g.POST("/archive/decompress", handles.FsArchiveDecompress)
+	// Torrent 相关接口
+	g.POST("/torrent/parse", handles.ParseTorrent)
+	g.POST("/torrent/upload_parse", handles.UploadTorrentAndParse)
+	g.POST("/torrent/rapid_upload", handles.TorrentRapidUpload)
+	g.POST("/torrent/generate", handles.GenerateTorrentForPath)
+	// Unified transfer seed APIs. Legacy torrent routes above remain supported.
+	seed := g.Group("/seed")
+	seed.POST("/parse", handles.ParseSeed)
+	seed.POST("/upload_parse", handles.UploadSeedAndParse)
+	seed.POST("/generate", handles.GenerateSeedForPaths)
+	seed.POST("/convert", handles.ConvertSeed)
+	seed.POST("/diagnose", handles.DiagnoseSeed)
+	seed.POST("/capabilities", handles.SeedCapabilities)
+	seed.POST("/rapid_upload", handles.QuickSaveSeed)
+	seed.POST("/offline_download", handles.QuickSaveSeed)
+	seed.POST("/update", handles.UpdateSeed)
+	seed.POST("/quick_save", handles.QuickSaveSeed)
+	seed.POST("/update_channels", handles.UpdateSeedChannels)
+	// Direct upload (client-side upload to storage)
+	g.POST("/get_direct_upload_info", handles.FsGetDirectUploadInfo)
+}
+
+func _task(g *gin.RouterGroup) {
+	handles.SetupTaskRoute(g)
+}
+
+func _sharing(g *gin.RouterGroup) {
+	g.Any("/list", handles.ListSharings)
+	g.GET("/get", handles.GetSharing)
+	g.POST("/create", handles.CreateSharing)
+	g.POST("/update", handles.UpdateSharing)
+	g.POST("/delete", handles.DeleteSharing)
+	g.POST("/enable", handles.SetEnableSharing(false))
+	g.POST("/disable", handles.SetEnableSharing(true))
+}
+
+func Cors(r *gin.Engine) {
+	config := cors.DefaultConfig()
+	// config.AllowAllOrigins = true
+	config.AllowOrigins = conf.Conf.Cors.AllowOrigins
+	config.AllowHeaders = conf.Conf.Cors.AllowHeaders
+	config.AllowMethods = conf.Conf.Cors.AllowMethods
+	r.Use(cors.New(config))
+}
+
+func InitS3(e *gin.Engine) {
+	Cors(e)
+	S3Server(e.Group("/"))
+}

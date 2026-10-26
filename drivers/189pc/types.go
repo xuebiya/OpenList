@@ -1,0 +1,538 @@
+package _189pc
+
+import (
+	"encoding/xml"
+	"fmt"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
+)
+
+// 居然有四种返回方式
+type RespErr struct {
+	ResCode    any    `json:"res_code"` // int or string
+	ResMessage string `json:"res_message"`
+
+	Error_ string `json:"error"`
+
+	XMLName xml.Name `xml:"error"`
+	Code    string   `json:"code" xml:"code"`
+	Message string   `json:"message" xml:"message"`
+	Msg     string   `json:"msg"`
+
+	ErrorCode string `json:"errorCode"`
+	ErrorMsg  string `json:"errorMsg"`
+}
+
+func (e *RespErr) HasError() bool {
+	switch v := e.ResCode.(type) {
+	case int, int64, int32:
+		return v != 0
+	case string:
+		return e.ResCode != ""
+	}
+	return (e.Code != "" && e.Code != "SUCCESS") || e.ErrorCode != "" || e.Error_ != ""
+}
+
+func (e *RespErr) Error() string {
+	switch v := e.ResCode.(type) {
+	case int, int64, int32:
+		if v != 0 {
+			return fmt.Sprintf("res_code: %d ,res_msg: %s", v, e.ResMessage)
+		}
+	case string:
+		if e.ResCode != "" {
+			return fmt.Sprintf("res_code: %s ,res_msg: %s", e.ResCode, e.ResMessage)
+		}
+	}
+
+	if e.Code != "" && e.Code != "SUCCESS" {
+		if e.Msg != "" {
+			return fmt.Sprintf("code: %s ,msg: %s", e.Code, e.Msg)
+		}
+		if e.Message != "" {
+			return fmt.Sprintf("code: %s ,msg: %s", e.Code, e.Message)
+		}
+		return "code: " + e.Code
+	}
+
+	if e.ErrorCode != "" {
+		return fmt.Sprintf("err_code: %s ,err_msg: %s", e.ErrorCode, e.ErrorMsg)
+	}
+
+	if e.Error_ != "" {
+		return fmt.Sprintf("error: %s ,message: %s", e.ErrorCode, e.Message)
+	}
+	return ""
+}
+
+type BaseLoginParam struct {
+	// 请求头参数
+	Lt    string
+	ReqId string
+	// logbox页面地址，作为后续请求的Referer，缺失会被判定为陌生设备
+	Referer string
+
+	// 表单参数
+	ParamId string
+
+	// 验证码
+	CaptchaToken string
+}
+
+// QRLoginParam 用于暂存二维码登录过程中的参数
+type QRLoginParam struct {
+	BaseLoginParam
+
+	UUID       string `json:"uuid"`
+	EncodeUUID string `json:"encodeuuid"`
+	EncryUUID  string `json:"encryuuid"`
+}
+
+// 登陆需要的参数
+type LoginParam struct {
+	// 加密后的用户名和密码
+	RsaUsername string
+	RsaPassword string
+
+	// rsa密钥
+	jRsaKey string
+	// 加密字段的前缀，服务端下发（如 {NRP}）
+	rsaPrefix string
+
+	// 设备二次校验时服务端返回的加密手机号
+	SecondAuthMobile string
+
+	BaseLoginParam
+}
+
+// encryptSecret 用登陆时拿到的公钥加密敏感值，格式与userName/epd一致
+func (p *LoginParam) encryptSecret(value string) string {
+	return p.rsaPrefix + RsaEncrypt(p.jRsaKey, value)
+}
+
+// 登陆加密相关
+type EncryptConfResp struct {
+	Result int `json:"result"`
+	Data   struct {
+		UpSmsOn   string `json:"upSmsOn"`
+		Pre       string `json:"pre"`
+		PreDomain string `json:"preDomain"`
+		PubKey    string `json:"pubKey"`
+	} `json:"data"`
+}
+
+type LoginResp struct {
+	Msg    string `json:"msg"`
+	Result int    `json:"result"`
+	ToUrl  string `json:"toUrl"`
+	// 设备二次校验时返回的加密手机号
+	Mobile string `json:"mobile"`
+}
+
+// 登陆页配置，新版登陆页的paramId由该接口下发
+// 该接口的result可能是数字也可能是字符串
+type AppConfResp struct {
+	Result any    `json:"result"`
+	Msg    string `json:"msg"`
+	Data   struct {
+		ParamId     string `json:"paramId"`
+		AccountType string `json:"accountType"`
+		ReturnUrl   string `json:"returnUrl"`
+		MailSuffix  string `json:"mailSuffix"`
+	} `json:"data"`
+}
+
+func (r *AppConfResp) Succeeded() bool {
+	switch v := r.Result.(type) {
+	case nil:
+		return true
+	case string:
+		return v == "0" || v == ""
+	case float64:
+		return v == 0
+	case int:
+		return v == 0
+	}
+	return false
+}
+
+// 刷新session返回
+type UserSessionResp struct {
+	ResCode    int    `json:"res_code"`
+	ResMessage string `json:"res_message"`
+
+	LoginName string `json:"loginName"`
+
+	KeepAlive       int `json:"keepAlive"`
+	GetFileDiffSpan int `json:"getFileDiffSpan"`
+	GetUserInfoSpan int `json:"getUserInfoSpan"`
+
+	// 个人云
+	SessionKey    string `json:"sessionKey"`
+	SessionSecret string `json:"sessionSecret"`
+	// 家庭云
+	FamilySessionKey    string `json:"familySessionKey"`
+	FamilySessionSecret string `json:"familySessionSecret"`
+}
+
+// 登录返回
+type AppSessionResp struct {
+	UserSessionResp
+
+	IsSaveName string `json:"isSaveName"`
+
+	// 会话刷新Token
+	AccessToken string `json:"accessToken"`
+	//Token刷新
+	RefreshToken string `json:"refreshToken"`
+}
+
+// 刷新token返回，失败时以HTTP 200返回result/msg，需要单独判断
+type RefreshTokenResp struct {
+	AccessToken  string `json:"accessToken"`
+	RefreshToken string `json:"refreshToken"`
+	ExpiresIn    int    `json:"expiresIn"`
+
+	Result int    `json:"result"`
+	Msg    string `json:"msg"`
+}
+
+func (r *RefreshTokenResp) HasError() bool {
+	return r.Result != 0 || r.AccessToken == ""
+}
+
+func (r *RefreshTokenResp) Error() string {
+	if r.Msg != "" {
+		return fmt.Sprintf("refresh token failed, result: %d, msg: %s", r.Result, r.Msg)
+	}
+	return fmt.Sprintf("refresh token failed, result: %d", r.Result)
+}
+
+// 家庭云账户
+type FamilyInfoListResp struct {
+	FamilyInfoResp []FamilyInfoResp `json:"familyInfoResp"`
+}
+type FamilyInfoResp struct {
+	Count      int    `json:"count"`
+	CreateTime string `json:"createTime"`
+	FamilyID   int64  `json:"familyId"`
+	RemarkName string `json:"remarkName"`
+	Type       int    `json:"type"`
+	UseFlag    int    `json:"useFlag"`
+	UserRole   int    `json:"userRole"`
+}
+
+/*文件部分*/
+// 文件
+type Cloud189File struct {
+	ID       String `json:"id"`
+	Name     string `json:"name"`
+	Size     int64  `json:"size"`
+	Md5      string `json:"md5"`
+	ParentID string `json:"-"` // 由 getFiles 设置，不从 JSON 解析
+
+	LastOpTime Time `json:"lastOpTime"`
+	CreateDate Time `json:"createDate"`
+	Icon       struct {
+		//iconOption 5
+		SmallUrl string `json:"smallUrl"`
+		LargeUrl string `json:"largeUrl"`
+
+		// iconOption 10
+		Max600    string `json:"max600"`
+		MediumURL string `json:"mediumUrl"`
+	} `json:"icon"`
+
+	// Orientation int64  `json:"orientation"`
+	// FileCata   int64  `json:"fileCata"`
+	// MediaType   int    `json:"mediaType"`
+	// Rev         string `json:"rev"`
+	// StarLabel   int64  `json:"starLabel"`
+}
+
+func normalizeCloud189Name(name string) string {
+	return strings.ReplaceAll(name, "\\'", "'")
+}
+
+func (c *Cloud189File) CreateTime() time.Time {
+	return time.Time(c.CreateDate)
+}
+
+func (c *Cloud189File) GetHash() utils.HashInfo {
+	return utils.NewHashInfo(utils.MD5, c.Md5)
+}
+
+func (c *Cloud189File) GetSize() int64     { return c.Size }
+func (c *Cloud189File) GetName() string    { return c.Name }
+func (c *Cloud189File) ModTime() time.Time { return time.Time(c.LastOpTime) }
+func (c *Cloud189File) IsDir() bool        { return false }
+func (c *Cloud189File) GetID() string      { return string(c.ID) }
+func (c *Cloud189File) GetPath() string    { return "" }
+func (c *Cloud189File) Thumb() string      { return c.Icon.SmallUrl }
+
+func (c *Cloud189File) GetDisplayName() string { return normalizeCloud189Name(c.Name) }
+
+// 文件夹
+type Cloud189Folder struct {
+	ID       String `json:"id"`
+	ParentID int64  `json:"parentId"`
+	Name     string `json:"name"`
+
+	LastOpTime Time `json:"lastOpTime"`
+	CreateDate Time `json:"createDate"`
+
+	// FileListSize int64 `json:"fileListSize"`
+	// FileCount int64 `json:"fileCount"`
+	// FileCata  int64 `json:"fileCata"`
+	// Rev          string `json:"rev"`
+	// StarLabel    int64  `json:"starLabel"`
+}
+
+func (c *Cloud189Folder) CreateTime() time.Time {
+	return time.Time(c.CreateDate)
+}
+
+func (c *Cloud189Folder) GetHash() utils.HashInfo {
+	return utils.HashInfo{}
+}
+
+func (c *Cloud189Folder) GetSize() int64     { return 0 }
+func (c *Cloud189Folder) GetName() string    { return c.Name }
+func (c *Cloud189Folder) ModTime() time.Time { return time.Time(c.LastOpTime) }
+func (c *Cloud189Folder) IsDir() bool        { return true }
+func (c *Cloud189Folder) GetID() string      { return string(c.ID) }
+func (c *Cloud189Folder) GetPath() string    { return "" }
+
+func (c *Cloud189Folder) GetDisplayName() string { return normalizeCloud189Name(c.Name) }
+
+type Cloud189FilesResp struct {
+	//ResCode    int    `json:"res_code"`
+	//ResMessage string `json:"res_message"`
+	FileListAO struct {
+		Count      int              `json:"count"`
+		FileList   []Cloud189File   `json:"fileList"`
+		FolderList []Cloud189Folder `json:"folderList"`
+	} `json:"fileListAO"`
+}
+
+// TaskInfo 任务信息
+type BatchTaskInfo struct {
+	// FileId 文件ID
+	FileId string `json:"fileId"`
+	// FileName 文件名
+	FileName string `json:"fileName"`
+	// IsFolder 是否是文件夹，0-否，1-是
+	IsFolder int `json:"isFolder"`
+	// SrcParentId 文件所在父目录ID
+	SrcParentId string `json:"srcParentId,omitempty"`
+
+	/* 冲突管理 */
+	// 1 -> 跳过 2 -> 保留 3 -> 覆盖
+	DealWay    int `json:"dealWay,omitempty"`
+	IsConflict int `json:"isConflict,omitempty"`
+}
+
+/* 上传部分 */
+type InitMultiUploadResp struct {
+	//Code string `json:"code"`
+	Data struct {
+		UploadType     int    `json:"uploadType"`
+		UploadHost     string `json:"uploadHost"`
+		UploadFileID   string `json:"uploadFileId"`
+		FileDataExists int    `json:"fileDataExists"`
+	} `json:"data"`
+}
+type UploadUrlsResp struct {
+	Code string                    `json:"code"`
+	Data map[string]UploadUrlsData `json:"uploadUrls"`
+}
+type UploadUrlsData struct {
+	RequestURL    string `json:"requestURL"`
+	RequestHeader string `json:"requestHeader"`
+}
+
+type UploadUrlInfo struct {
+	PartNumber int
+	Headers    map[string]string
+	UploadUrlsData
+}
+
+type UploadProgress struct {
+	UploadInfo  InitMultiUploadResp
+	UploadParts []string
+}
+
+/* 第二种上传方式 */
+type CreateUploadFileResp struct {
+	// 上传文件请求ID
+	UploadFileId int64 `json:"uploadFileId"`
+	// 上传文件数据的URL路径
+	FileUploadUrl string `json:"fileUploadUrl"`
+	// 上传文件完成后确认路径
+	FileCommitUrl string `json:"fileCommitUrl"`
+	// 文件是否已存在云盘中，0-未存在，1-已存在
+	FileDataExists int `json:"fileDataExists"`
+}
+
+type GetUploadFileStatusResp struct {
+	CreateUploadFileResp
+
+	// 已上传的大小
+	DataSize int64 `json:"dataSize"`
+	Size     int64 `json:"size"`
+}
+
+func (r *GetUploadFileStatusResp) GetSize() int64 {
+	return r.DataSize + r.Size
+}
+
+type CommitMultiUploadFileResp struct {
+	File struct {
+		UserFileID String `json:"userFileId"`
+		FileName   string `json:"fileName"`
+		FileSize   int64  `json:"fileSize"`
+		FileMd5    string `json:"fileMd5"`
+		CreateDate Time   `json:"createDate"`
+	} `json:"file"`
+}
+
+func (f *CommitMultiUploadFileResp) toFile() *Cloud189File {
+	return &Cloud189File{
+		ID:         f.File.UserFileID,
+		Name:       f.File.FileName,
+		Size:       f.File.FileSize,
+		Md5:        f.File.FileMd5,
+		LastOpTime: f.File.CreateDate,
+		CreateDate: f.File.CreateDate,
+	}
+}
+
+type OldCommitUploadFileResp struct {
+	XMLName    xml.Name `xml:"file"`
+	ID         String   `xml:"id"`
+	Name       string   `xml:"name"`
+	Size       int64    `xml:"size"`
+	Md5        string   `xml:"md5"`
+	CreateDate Time     `xml:"createDate"`
+}
+
+func (f *OldCommitUploadFileResp) toFile() *Cloud189File {
+	return &Cloud189File{
+		ID:         f.ID,
+		Name:       f.Name,
+		Size:       f.Size,
+		Md5:        f.Md5,
+		CreateDate: f.CreateDate,
+		LastOpTime: f.CreateDate,
+	}
+}
+
+type CreateBatchTaskResp struct {
+	TaskID string `json:"taskId"`
+}
+
+type BatchTaskStateResp struct {
+	FailedCount         int     `json:"failedCount"`
+	Process             int     `json:"process"`
+	SkipCount           int     `json:"skipCount"`
+	SubTaskCount        int     `json:"subTaskCount"`
+	SuccessedCount      int     `json:"successedCount"`
+	SuccessedFileIDList []int64 `json:"successedFileIdList"`
+	TaskID              string  `json:"taskId"`
+	TaskStatus          int     `json:"taskStatus"` //1 初始化 2 存在冲突 3 执行中，4 完成
+}
+
+type BatchTaskConflictTaskInfoResp struct {
+	SessionKey     string `json:"sessionKey"`
+	TargetFolderID int    `json:"targetFolderId"`
+	TaskID         string `json:"taskId"`
+	TaskInfos      []BatchTaskInfo
+	TaskType       int `json:"taskType"`
+}
+
+/* query 加密参数*/
+type Params map[string]string
+
+func (p Params) Set(k, v string) {
+	p[k] = v
+}
+
+func (p Params) Encode() string {
+	if p == nil {
+		return ""
+	}
+	var buf strings.Builder
+	keys := make([]string, 0, len(p))
+	for k := range p {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for i := range keys {
+		if buf.Len() > 0 {
+			buf.WriteByte('&')
+		}
+		buf.WriteString(keys[i])
+		buf.WriteByte('=')
+		buf.WriteString(p[keys[i]])
+	}
+	return buf.String()
+}
+
+type CapacityResp struct {
+	ResCode           int    `json:"res_code"`
+	ResMessage        string `json:"res_message"`
+	Account           string `json:"account"`
+	CloudCapacityInfo struct {
+		FreeSize     int64 `json:"freeSize"`
+		MailUsedSize int64 `json:"mail189UsedSize"`
+		TotalSize    int64 `json:"totalSize"`
+		UsedSize     int64 `json:"usedSize"`
+	} `json:"cloudCapacityInfo"`
+	FamilyCapacityInfo struct {
+		FreeSize  int64 `json:"freeSize"`
+		TotalSize int64 `json:"totalSize"`
+		UsedSize  int64 `json:"usedSize"`
+	} `json:"familyCapacityInfo"`
+	TotalSize uint64 `json:"totalSize"`
+}
+
+type RenameResp struct {
+	ResMsg      string `json:"res_message"`
+	CreateDate  Time   `json:"createDate"`
+	FileCate    int    `json:"fileCata"`
+	ID          String `json:"id"`
+	LastOpTime  Time   `json:"lastOpTime"`
+	MD5         string `json:"md5"`
+	MediaType   int    `json:"mediaType"`
+	Name        string `json:"name"`
+	Oeientation int    `json:"orientation"`
+	ParentID    int64  `json:"parentId"`
+	Rev         string `json:"rev"`
+	Size        int64  `json:"size"`
+	ResCode     any    `json:"res_code"` // int or string
+}
+
+func (r *RenameResp) toFile(f *Cloud189File) *Cloud189File {
+	return &Cloud189File{
+		ID:         r.ID,
+		Name:       r.Name,
+		Size:       r.Size,
+		Md5:        r.MD5,
+		LastOpTime: r.LastOpTime,
+		CreateDate: r.CreateDate,
+		Icon:       f.Icon,
+	}
+}
+
+func (r *RenameResp) toFolder() *Cloud189Folder {
+	return &Cloud189Folder{
+		ID:         r.ID,
+		Name:       r.Name,
+		ParentID:   r.ParentID,
+		LastOpTime: r.LastOpTime,
+		CreateDate: r.CreateDate,
+	}
+}

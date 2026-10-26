@@ -1,0 +1,213 @@
+name: Fork All Platform Binaries
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: fork-binaries-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  frontend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      sha: ${{ steps.ref.outputs.sha }}
+      tag: ${{ steps.ref.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read pinned fork frontend commit
+        id: ref
+        run: |
+          sha=$(tr -d '\r\n' < frontend-ref.txt)
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "tag=build-${GITHUB_RUN_NUMBER}-${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          repository: xuebiya/OpenList-Frontend
+          ref: ${{ steps.ref.outputs.sha }}
+          path: fork-frontend
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: fork-frontend/package.json
+      - name: Build only the pinned fork source
+        working-directory: fork-frontend
+        run: |
+          set -euo pipefail
+          bash build.sh --dev --no-compress --skip-i18n
+          printf '%s\n' '${{ steps.ref.outputs.sha }}' > dist/FRONTEND_COMMIT.txt
+          tar -czf ../frontend.tar.gz -C dist .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pinned-fork-frontend
+          path: frontend.tar.gz
+          if-no-files-found: error
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.ref.outputs.tag }}
+          FRONTEND_SHA: ${{ steps.ref.outputs.sha }}
+        run: |
+          printf 'Backend: `%s`\nFrontend: https://github.com/xuebiya/OpenList-Frontend/commit/%s\n\nEach OS/architecture has its own archive and SHA-256 file. No official frontend assets are used. See build-summary.txt for target results.\n' "$GITHUB_SHA" "$FRONTEND_SHA" > notes.md
+          gh release create "$TAG" --target "$GITHUB_SHA" --title "OpenList $TAG" --notes-file notes.md --draft
+  build:
+    needs: frontend
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      max-parallel: 10
+      matrix:
+        target:
+          - darwin-amd64
+          - darwin-arm64
+          - linux-386
+          - linux-amd64
+          - linux-arm-5
+          - linux-arm-6
+          - linux-arm-7
+          - linux-arm64
+          - linux-mips
+          - linux-mipsle
+          - linux-mips64
+          - linux-mips64le
+          - linux-ppc64le
+          - linux-riscv64
+          - linux-loong64
+          - linux-loong64-abi1.0
+          - linux-s390x
+          - windows-386
+          - windows-amd64
+          - linux-arm64-musl
+          - linux-arm-musleabi
+          - linux-arm-musleabihf
+          - linux-armel-musleabi
+          - linux-armel-musleabihf
+          - linux-armv5l-musleabi
+          - linux-armv5l-musleabihf
+          - linux-armv6-musleabi
+          - linux-armv6-musleabihf
+          - linux-armv7l-musleabihf
+          - linux-armv7m-musleabi
+          - linux-armv7r-musleabihf
+          - linux-mips-musl
+          - linux-mips64-musl
+          - linux-mips64le-musl
+          - linux-mipsle-musl
+          - linux-ppc64le-musl
+          - linux-riscv64-musl
+          - linux-s390x-musl
+          - linux-amd64-musl
+          - linux-loong64-musl
+          - windows-arm64
+          - android-386
+          - android-amd64
+          - android-arm64
+          - android-arm
+          - freebsd-386
+          - freebsd-amd64
+          - freebsd-arm64
+          - windows7-386
+          - windows7-amd64
+    name: Build ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: pinned-fork-frontend
+          path: frontend-input
+      - name: Embed verified fork frontend
+        run: |
+          mkdir -p public/dist
+          tar -xzf frontend-input/frontend.tar.gz -C public/dist
+          test -s public/dist/index.html
+          test "$(cat public/dist/FRONTEND_COMMIT.txt)" = '${{ needs.frontend.outputs.sha }}'
+      - name: Select SQLite compatibility tags
+        id: tags
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          tags=jsoniter
+          case "$TARGET" in
+            linux-mips*|linux-loong64*|windows-386|windows7-*) tags=jsoniter,sqlite_cgo_compat ;;
+          esac
+          echo "value=$tags" >> "$GITHUB_OUTPUT"
+      - name: Cross-compile one target with CGO
+        uses: OpenListTeam/cgo-actions@d760a8ec1a6be1f8ec181229e11cb2671797f9e0
+        with:
+          targets: ${{ matrix.target }}
+          tags: ${{ steps.tags.outputs.value }}
+          flags: ${{ contains(matrix.target, '-musl') && '-ldflags=-w -s -linkmode external -extldflags ''-static -fpic''' || '-ldflags=-w -s' }}
+          static-link-for-musl: true
+          github-token: ${{ github.token }}
+          out-dir: binaries
+          output: openlist$ext
+          x-flags: |
+            github.com/OpenListTeam/OpenList/v4/internal/conf.GitCommit=${{ github.sha }}
+            github.com/OpenListTeam/OpenList/v4/internal/conf.Version=${{ needs.frontend.outputs.tag }}
+            github.com/OpenListTeam/OpenList/v4/internal/conf.WebVersion=${{ needs.frontend.outputs.sha }}
+      - name: Package independent platform archive
+        env:
+          TARGET: ${{ matrix.target }}
+          FRONTEND_SHA: ${{ needs.frontend.outputs.sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          printf 'backend=%s\nfrontend_repository=xuebiya/OpenList-Frontend\nfrontend_commit=%s\ntarget=%s\n' "$GITHUB_SHA" "$FRONTEND_SHA" "$TARGET" > binaries/BUILD_INFO.txt
+          cp LICENSE binaries/LICENSE
+          if [[ "$TARGET" == windows* ]]; then
+            test -s binaries/openlist.exe
+            (cd binaries && zip -q ../release/openlist-${TARGET}.zip openlist.exe BUILD_INFO.txt LICENSE)
+          else
+            test -s binaries/openlist
+            chmod +x binaries/openlist
+            if [[ "$TARGET" == *-musl* ]]; then
+              if readelf -l binaries/openlist | grep -q 'Requesting program interpreter'; then
+                echo 'ERROR: musl binary is dynamically linked'; exit 1
+              fi
+            fi
+            tar -czf release/openlist-${TARGET}.tar.gz -C binaries openlist BUILD_INFO.txt LICENSE
+          fi
+          (cd release && sha256sum * > openlist-${TARGET}.sha256)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openlist-${{ matrix.target }}
+          path: release/*
+          if-no-files-found: error
+          compression-level: 0
+      - name: Upload separate release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.frontend.outputs.tag }}
+        run: gh release upload "$TAG" release/* --clobber
+  publish:
+    needs: [frontend, build]
+    if: ${{ always() && needs.frontend.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Finalize release with explicit build status
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.frontend.outputs.tag }}
+          RESULT: ${{ needs.build.result }}
+        run: |
+          printf 'backend=%s\nfrontend=%s\nmatrix_result=%s\nexpected_targets=50\n' "$GITHUB_SHA" '${{ needs.frontend.outputs.sha }}' "$RESULT" > build-summary.txt
+          gh release upload "$TAG" build-summary.txt --clobber
+          if [[ "$RESULT" == success ]]; then
+            gh release edit "$TAG" --draft=false --latest
+          else
+            gh release edit "$TAG" --draft=false --prerelease --latest=false
+            echo 'Some targets failed; inspect platform-specific jobs.'
+            exit 1
+          fi
