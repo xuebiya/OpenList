@@ -15,6 +15,7 @@ type Addition struct {
 }
 
 var config = driver.Config{
+	LocalSort:     true,
 	Name:          "115 Cloud",
 	DefaultRoot:   "0",
 	LinkCacheMode: driver.LinkCacheUA,
