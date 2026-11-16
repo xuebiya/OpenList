@@ -199,6 +199,12 @@ func admin(g *gin.RouterGroup) {
 	driver.GET("/list", handles.ListDriverInfo)
 	driver.GET("/names", handles.ListDriverNames)
 	driver.GET("/info", handles.GetDriverInfo)
+	driver.POST("/115/qrcode/start", handles.Start115QRCodeLogin)
+	driver.POST("/115/qrcode/status", handles.Get115QRCodeLoginStatus)
+	driver.POST("/pikpak/login/start", handles.StartPikPakBrowserLogin)
+	driver.POST("/pikpak/login/view", handles.ViewPikPakBrowserLogin)
+	driver.POST("/pikpak/login/input", handles.InputPikPakBrowserLogin)
+	driver.POST("/pikpak/login/close", handles.ClosePikPakBrowserLogin)
 
 	setting := g.Group("/setting")
 	setting.GET("/get", handles.GetSetting)
